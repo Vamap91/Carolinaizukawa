@@ -2,11 +2,13 @@ import os
 import re
 import json
 import logging
+from io import BytesIO
 from urllib.parse import urlparse
 from typing import List, Literal, Optional, Dict, Any
 from datetime import datetime, timezone
 
 import streamlit as st
+import pandas as pd
 from pydantic import BaseModel, Field, PositiveInt, validator
 
 # =========================
@@ -22,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chatgpt-web-scraper-app")
 
 # =========================
-# Secrets seguros (sem chaves hardcoded)
+# Secrets seguros
 # =========================
 def get_secret(name: str) -> Optional[str]:
     try:
@@ -61,11 +63,9 @@ class AppSettings(BaseModel):
             "Responda em português do Brasil, de forma clara e prática."
         )
     )
-    # Tavily
     use_tavily: bool = Field(default=True)
     tavily_depth: Literal["basic", "advanced"] = Field(default="basic")
     tavily_max_results: PositiveInt = Field(default=5)
-    # Scraper
     inject_scrape: bool = Field(default=True)
     scrape_char_limit: PositiveInt = Field(default=8000)
 
@@ -77,13 +77,73 @@ class AppSettings(BaseModel):
 # Estado da sessão
 # =========================
 if "history" not in st.session_state:
-    st.session_state.history = []   # lista de {role, content}
+    st.session_state.history = []
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
 if "scrape_context" not in st.session_state:
-    st.session_state.scrape_context = ""   # último conteúdo raspado
+    st.session_state.scrape_context = ""
 if "scrape_url" not in st.session_state:
-    st.session_state.scrape_url = ""       # última URL raspada
+    st.session_state.scrape_url = ""
+if "scrape_title" not in st.session_state:
+    st.session_state.scrape_title = ""
+
+# =========================
+# Utilidades comuns
+# =========================
+def normalize_whitespace(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+def build_scrape_dataframe() -> Optional[pd.DataFrame]:
+    txt = (st.session_state.scrape_context or "").strip()
+    url = st.session_state.scrape_url or ""
+    title = st.session_state.scrape_title or ""
+    if not txt:
+        return None
+    # separa por parágrafos em blocos não vazios
+    parts = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
+    rows = []
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    for i, p in enumerate(parts, start=1):
+        rows.append(
+            {
+                "timestamp_utc": ts,
+                "url": url,
+                "title": title,
+                "paragraph_index": i,
+                "paragraph_length": len(p),
+                "text": p,
+            }
+        )
+    return pd.DataFrame(rows)
+
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "scrape") -> bytes:
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    bio.seek(0)
+    return bio.read()
+
+def render_excel_download_button_in_sidebar():
+    """Cria (ou atualiza) o botão de download no sidebar conforme o estado atual."""
+    with st.sidebar:
+        st.markdown("### Exportação")
+        df_preview = build_scrape_dataframe()
+        if df_preview is None or df_preview.empty:
+            st.caption("Nenhum conteúdo raspado disponível para exportação.")
+            return
+        parsed = urlparse(st.session_state.scrape_url or "")
+        host = (parsed.netloc or "conteudo").replace(":", "_")
+        ts_fname = datetime.now().strftime("%Y%m%d-%H%M%S")
+        fname = f"raspagem_{host}_{ts_fname}.xlsx"
+        st.download_button(
+            label="Baixar Excel da raspagem",
+            data=df_to_excel_bytes(df_preview),
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
 # =========================
 # Sidebar de Configuração
@@ -102,7 +162,7 @@ with st.sidebar:
         height=140
     )
 
-    st.markdown("### Busca online (Tavily)")
+    st.markdown("### Busca online Tavily")
     use_tavily = st.checkbox(
         "Ativar busca online",
         value=bool(st.session_state.settings.get("use_tavily", True))
@@ -116,45 +176,52 @@ with st.sidebar:
         int(st.session_state.settings.get("tavily_max_results", 5))
     )
 
-    st.markdown("### Raspagem de HTML (URL)")
+    st.markdown("### Raspagem de HTML")
     inject_scrape = st.checkbox(
         "Injetar conteúdo raspado na conversa",
         value=bool(st.session_state.settings.get("inject_scrape", True))
     )
     scrape_char_limit = st.slider(
         "Limite de caracteres do texto raspado",
-        min_value=1000, max_value=20000, value=int(st.session_state.settings.get("scrape_char_limit", 8000)), step=500
+        min_value=1000, max_value=20000,
+        value=int(st.session_state.settings.get("scrape_char_limit", 8000)),
+        step=500
     )
 
-    try:
-        cfg = AppSettings(
-            model=model,
-            temperature=temperature,
-            max_tokens=int(max_tokens),
-            system_prompt=system_prompt,
-            use_tavily=use_tavily,
-            tavily_depth=tavily_depth,  # type: ignore
-            tavily_max_results=int(tavily_max_results),
-            inject_scrape=inject_scrape,
-            scrape_char_limit=int(scrape_char_limit)
-        )
-        st.session_state.settings = cfg.dict()
-    except Exception as e:
-        st.error(f"Configuração inválida: {e}")
-
+    # Botão de limpar histórico
     st.markdown("---")
     if st.button("Limpar histórico"):
         st.session_state.history = []
         st.success("Histórico limpo.")
 
+# cria/atualiza o botão de download com o estado atual
+render_excel_download_button_in_sidebar()
+
+# Atualiza objeto de configuração validado (fora do with para evitar conflitos de estado)
+try:
+    cfg = AppSettings(
+        model=model,
+        temperature=temperature,
+        max_tokens=int(max_tokens),
+        system_prompt=system_prompt,
+        use_tavily=use_tavily,
+        tavily_depth=tavily_depth,  # type: ignore
+        tavily_max_results=int(tavily_max_results),
+        inject_scrape=inject_scrape,
+        scrape_char_limit=int(scrape_char_limit)
+    )
+    st.session_state.settings = cfg.dict()
+except Exception as e:
+    st.error(f"Configuração inválida: {e}")
+
 # =========================
 # Cabeçalho
 # =========================
 st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
-st.caption("Raspagem direta → Tavily Extract → Jina Reader. Três camadas de fallback para maximizar a extração.")
+st.caption("Raspagem direta com fallback para Tavily Extract e Jina Reader. Exportação para Excel no sidebar.")
 
 # =========================
-# Utilidades: OpenAI + Tavily + Scraper
+# Utilidades de IA e Web
 # =========================
 def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
     full_messages = [{"role": "system", "content": system_prompt}] + messages
@@ -189,11 +256,6 @@ def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dic
     }
     try:
         resp = requests.post(url, json=payload, timeout=45)
-        text = ""
-        try:
-            text = resp.text
-        except Exception:
-            pass
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -201,10 +263,6 @@ def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dic
         return {"error": f"Erro ao consultar Tavily: {e}"}
 
 def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
-    """
-    Fallback 2: Tavily Extract API.
-    Retorna {'ok', 'title', 'content', 'error', 'raw'}.
-    """
     if not TAVILY_API_KEY:
         return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida.", "raw": ""}
     import requests
@@ -226,51 +284,30 @@ def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
         return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}", "raw": ""}
 
 def jina_reader_fetch(url_to_fetch: str) -> Dict[str, Any]:
-    """
-    Fallback 3: Jina Reader (sem chave). Formato: https://r.jina.ai/http://example.com
-    Retorna {'ok', 'title', 'content', 'error'}.
-    """
     import requests
-    # Garante esquema http/https
     parsed = urlparse(url_to_fetch)
     if not parsed.scheme:
         url_to_fetch = "https://" + url_to_fetch
         parsed = urlparse(url_to_fetch)
-
-    # Monta URL do reader
     reader_url = f"https://r.jina.ai/{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
     if parsed.query:
         reader_url += f"?{parsed.query}"
-
     try:
         resp = requests.get(reader_url, timeout=45)
         text = resp.text or ""
         if resp.status_code >= 400 or not text.strip():
             return {"ok": False, "title": "", "content": "", "error": f"Reader HTTP {resp.status_code}"}
-        # O Jina reader já devolve texto "readable"
         return {"ok": True, "title": "", "content": text, "error": None}
     except Exception as e:
         logger.exception("Erro Jina Reader")
         return {"ok": False, "title": "", "content": "", "error": f"Falha no Jina Reader: {e}"}
 
-# -------- Scraper HTML --------
-def normalize_whitespace(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
-
 def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
-    """
-    Tenta baixar HTML diretamente. Retorna dict com ok/title/text/error/status_code.
-    """
     import requests
     from bs4 import BeautifulSoup
-
-    # Garante esquema
     parsed = urlparse(url)
     if not parsed.scheme:
         url = "https://" + url
-
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -289,7 +326,6 @@ def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; Streamli
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
             return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
         try:
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "lxml")
         except Exception:
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -305,40 +341,39 @@ def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; Streamli
 def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
     """
     Estratégia em camadas:
-      1) Raspagem direta (headers realistas)
-      2) Tavily Extract (se TAVILY_API_KEY e erro/403/422/429 etc.)
-      3) Jina Reader (sem chave)
+      1) Direto
+      2) Tavily Extract (se chave)
+      3) Jina Reader
     """
     if not url or not isinstance(url, str):
         return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
 
-    # 1) Direto
     direct = scrape_direct(url)
     if direct.get("ok"):
         text = direct["text"]
         if len(text) > char_limit:
             text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
+        st.session_state.scrape_title = direct["title"]
         return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
 
-    # 2) Tavily Extract (inclusive quando 422)
     if TAVILY_API_KEY:
         te = tavily_extract(url)
         if te.get("ok"):
             text = normalize_whitespace(te["content"])
             if len(text) > char_limit:
                 text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-            return {"ok": True, "url": url, "title": te.get("title") or url, "text": text, "error": None}
+            st.session_state.scrape_title = te.get("title") or ""
+            return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
         else:
-            # Guarda diagnóstico detalhado do 422/erro p/ exibir ao usuário
             st.session_state["_last_tavily_extract_error"] = te.get("error")
 
-    # 3) Jina Reader
     jr = jina_reader_fetch(url)
     if jr.get("ok"):
         text = normalize_whitespace(jr["content"])
         if len(text) > char_limit:
             text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        return {"ok": True, "url": url, "title": jr.get("title") or url, "text": text, "error": None}
+        st.session_state.scrape_title = jr.get("title") or ""
+        return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
 
     return {"ok": False, "url": url, "title": "", "text": "", "error": jr.get("error") or direct.get("error") or "Falha desconhecida"}
 
@@ -415,6 +450,8 @@ if scrape_btn and url_input:
         st.success(f"Conteúdo raspado de: {res.get('title') or res.get('url')}")
         with st.expander("Prévia do texto raspado"):
             st.write(res["text"])
+        # 👉 Garante que o sidebar se atualize já com o conteúdo raspado
+        st.rerun()
 
 # =========================
 # Área de chat
@@ -424,12 +461,10 @@ render_history(st.session_state.history)
 
 user_input = st.chat_input("Digite sua mensagem...")
 if user_input:
-    # 1) Mensagem do usuário
     st.session_state.history.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 2) Opcional: injeta contexto do scraper
     s = st.session_state.settings
     if s.get("inject_scrape", True) and st.session_state.scrape_context:
         scraped_md = "### Contexto de página (raspado via URL)\n\n" + st.session_state.scrape_context
@@ -437,14 +472,12 @@ if user_input:
             st.markdown(scraped_md)
         st.session_state.history.append({"role": "assistant", "content": scraped_md})
 
-    # 3) Opcional: contexto via Tavily
     web_ctx_md = inject_web_context_if_enabled(user_input)
     if web_ctx_md:
         with st.chat_message("assistant"):
             st.markdown(web_ctx_md)
         st.session_state.history.append({"role": "assistant", "content": f"(Contexto externo adicionado da web)\n\n{web_ctx_md}"})
 
-    # 4) Geração da resposta
     with st.chat_message("assistant"):
         try:
             reply = openai_stream_chat(
@@ -460,7 +493,7 @@ if user_input:
             st.error(f"Ocorreu um erro ao chamar o modelo: {e}")
 
 # =========================
-# Rodapé com diagnósticos
+# Diagnóstico
 # =========================
 with st.expander("Diagnóstico técnico"):
     s = st.session_state.settings
@@ -481,6 +514,6 @@ with st.expander("Diagnóstico técnico"):
     )
 
 st.caption(
-    "Secrets: OPENAI_API_KEY (obrigatório) e TAVILY_API_KEY (opcional, para busca e fallback). "
+    "Secrets necessários: OPENAI_API_KEY e (opcional) TAVILY_API_KEY. "
     "Nenhuma chave é armazenada no código."
 )
