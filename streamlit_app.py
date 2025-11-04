@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, PositiveInt, validator
 # Configuração básica
 # =========================
 st.set_page_config(
-    page_title="Meu ChatGPT • Streamlit",
+    page_title="Meu ChatGPT • Streamlit CAH",
     page_icon="🤖",
     layout="centered"
 )
