@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+from urllib.parse import urlparse
 from typing import List, Literal, Optional, Dict, Any
 from datetime import datetime, timezone
 
@@ -150,7 +151,7 @@ with st.sidebar:
 # Cabeçalho
 # =========================
 st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
-st.caption("Cole um link para raspar HTML. Se o site bloquear (403), usamos Tavily Extract como fallback.")
+st.caption("Raspagem direta → Tavily Extract → Jina Reader. Três camadas de fallback para maximizar a extração.")
 
 # =========================
 # Utilidades: OpenAI + Tavily + Scraper
@@ -188,6 +189,11 @@ def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dic
     }
     try:
         resp = requests.post(url, json=payload, timeout=45)
+        text = ""
+        try:
+            text = resp.text
+        except Exception:
+            pass
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -196,30 +202,169 @@ def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dic
 
 def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
     """
-    Fallback para extrair texto de uma URL usando Tavily Extract API.
-    Retorna um dicionário com keys 'ok', 'title', 'content', 'error'.
+    Fallback 2: Tavily Extract API.
+    Retorna {'ok', 'title', 'content', 'error', 'raw'}.
     """
     if not TAVILY_API_KEY:
-        return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida."}
+        return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida.", "raw": ""}
     import requests
     api = "https://api.tavily.com/extract"
     payload = {"api_key": TAVILY_API_KEY, "url": url_to_fetch}
     try:
         resp = requests.post(api, json=payload, timeout=45)
-        resp.raise_for_status()
-        data = resp.json() or {}
+        raw = resp.text
+        if resp.status_code >= 400:
+            return {"ok": False, "title": "", "content": "", "error": f"HTTP {resp.status_code}: {raw[:400]}", "raw": raw}
+        data = resp.json() if raw else {}
         title = data.get("title") or ""
         content = data.get("content") or data.get("text") or ""
         if not content:
-            return {"ok": False, "title": title, "content": "", "error": "Sem conteúdo retornado pela Tavily."}
-        return {"ok": True, "title": title, "content": content, "error": None}
+            return {"ok": False, "title": title, "content": "", "error": "Sem conteúdo retornado pela Tavily.", "raw": raw}
+        return {"ok": True, "title": title, "content": content, "error": None, "raw": raw}
     except Exception as e:
         logger.exception("Erro Tavily (extract)")
-        return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}"}
+        return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}", "raw": ""}
 
-def format_tavily_context(data: Dict[str, Any]) -> str:
+def jina_reader_fetch(url_to_fetch: str) -> Dict[str, Any]:
+    """
+    Fallback 3: Jina Reader (sem chave). Formato: https://r.jina.ai/http://example.com
+    Retorna {'ok', 'title', 'content', 'error'}.
+    """
+    import requests
+    # Garante esquema http/https
+    parsed = urlparse(url_to_fetch)
+    if not parsed.scheme:
+        url_to_fetch = "https://" + url_to_fetch
+        parsed = urlparse(url_to_fetch)
+
+    # Monta URL do reader
+    reader_url = f"https://r.jina.ai/{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
+    if parsed.query:
+        reader_url += f"?{parsed.query}"
+
+    try:
+        resp = requests.get(reader_url, timeout=45)
+        text = resp.text or ""
+        if resp.status_code >= 400 or not text.strip():
+            return {"ok": False, "title": "", "content": "", "error": f"Reader HTTP {resp.status_code}"}
+        # O Jina reader já devolve texto "readable"
+        return {"ok": True, "title": "", "content": text, "error": None}
+    except Exception as e:
+        logger.exception("Erro Jina Reader")
+        return {"ok": False, "title": "", "content": "", "error": f"Falha no Jina Reader: {e}"}
+
+# -------- Scraper HTML --------
+def normalize_whitespace(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
+    """
+    Tenta baixar HTML diretamente. Retorna dict com ok/title/text/error/status_code.
+    """
+    import requests
+    from bs4 import BeautifulSoup
+
+    # Garante esquema
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = "https://" + url
+
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "close",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=45)
+        content_type = resp.headers.get("Content-Type", "")
+        status = resp.status_code
+        if status >= 400:
+            return {"ok": False, "title": "", "text": "", "error": f"HTTP {status}", "status_code": status}
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template"]):
+            tag.decompose()
+        title = (soup.title.string if soup.title else "") or ""
+        text = normalize_whitespace(soup.get_text(separator="\n"))
+        return {"ok": True, "title": title.strip(), "text": text, "error": None, "status_code": status}
+    except Exception as e:
+        logger.exception("Erro no download direto")
+        return {"ok": False, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}", "status_code": None}
+
+def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
+    """
+    Estratégia em camadas:
+      1) Raspagem direta (headers realistas)
+      2) Tavily Extract (se TAVILY_API_KEY e erro/403/422/429 etc.)
+      3) Jina Reader (sem chave)
+    """
+    if not url or not isinstance(url, str):
+        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
+
+    # 1) Direto
+    direct = scrape_direct(url)
+    if direct.get("ok"):
+        text = direct["text"]
+        if len(text) > char_limit:
+            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
+        return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
+
+    # 2) Tavily Extract (inclusive quando 422)
+    if TAVILY_API_KEY:
+        te = tavily_extract(url)
+        if te.get("ok"):
+            text = normalize_whitespace(te["content"])
+            if len(text) > char_limit:
+                text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
+            return {"ok": True, "url": url, "title": te.get("title") or url, "text": text, "error": None}
+        else:
+            # Guarda diagnóstico detalhado do 422/erro p/ exibir ao usuário
+            st.session_state["_last_tavily_extract_error"] = te.get("error")
+
+    # 3) Jina Reader
+    jr = jina_reader_fetch(url)
+    if jr.get("ok"):
+        text = normalize_whitespace(jr["content"])
+        if len(text) > char_limit:
+            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
+        return {"ok": True, "url": url, "title": jr.get("title") or url, "text": text, "error": None}
+
+    return {"ok": False, "url": url, "title": "", "text": "", "error": jr.get("error") or direct.get("error") or "Falha desconhecida"}
+
+def render_history(messages: List[dict]):
+    for m in messages:
+        if m["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(m["content"])
+        else:
+            with st.chat_message("assistant"):
+                st.markdown(m["content"])
+
+def inject_web_context_if_enabled(user_msg: str) -> Optional[str]:
+    s = st.session_state.settings
+    if not s.get("use_tavily", True):
+        return None
+    data = tavily_search(
+        query=user_msg,
+        depth=s.get("tavily_depth", "basic"),
+        max_results=int(s.get("tavily_max_results", 5))
+    )
     if "error" in data:
         return f"(Falha ao obter contexto da web: {data['error']})"
+    return format_tavily_context(data)
+
+def format_tavily_context(data: Dict[str, Any]) -> str:
     answer = data.get("answer") or ""
     results = data.get("results", []) or []
     top = results[:5]
@@ -241,102 +386,6 @@ def format_tavily_context(data: Dict[str, Any]) -> str:
         header += "\n(Nenhuma fonte relevante retornada.)"
     return header
 
-# -------- Scraper HTML --------
-def normalize_whitespace(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
-
-def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
-    """
-    Tenta baixar HTML diretamente. Retorna dict com ok/title/text/error/status_code.
-    """
-    import requests
-    from bs4 import BeautifulSoup
-
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "close",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=45)
-        content_type = resp.headers.get("Content-Type", "")
-        status = resp.status_code
-        if status >= 400:
-            return {"ok": False, "title": "", "text": "", "error": f"HTTP {status}", "status_code": status}
-        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
-        try:
-            soup = BeautifulSoup(resp.text, "lxml")
-        except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "template"]):
-            tag.decompose()
-        title = (soup.title.string if soup.title else "") or ""
-        text = normalize_whitespace(soup.get_text(separator="\n"))
-        return {"ok": True, "title": title.strip(), "text": text, "error": None, "status_code": status}
-    except Exception as e:
-        logger.exception("Erro no download direto")
-        return {"ok": False, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}", "status_code": None}
-
-def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
-    """
-    Estratégia em camadas:
-      1) Tenta raspagem direta (headers realistas).
-      2) Se 401/403/406/429 ou erro → fallback para Tavily Extract (se chave existir).
-    """
-    if not url or not isinstance(url, str):
-        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
-
-    # 1) Tentativa direta
-    direct = scrape_direct(url)
-    if direct.get("ok"):
-        text = direct["text"]
-        if len(text) > char_limit:
-            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
-
-    status = direct.get("status_code")
-    hard_block = status in {401, 403, 406, 429}
-    if not hard_block and TAVILY_API_KEY is None:
-        # erro que não é bloqueio + sem Tavily → reporta direto
-        return {"ok": False, "url": url, "title": "", "text": "", "error": direct.get("error") or "Falha desconhecida"}
-
-    # 2) Fallback via Tavily Extract
-    te = tavily_extract(url)
-    if not te.get("ok"):
-        return {"ok": False, "url": url, "title": te.get("title") or "", "text": "", "error": te.get("error") or direct.get("error")}
-
-    text = normalize_whitespace(te["content"])
-    if len(text) > char_limit:
-        text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-    return {"ok": True, "url": url, "title": te.get("title") or url, "text": text, "error": None}
-
-def render_history(messages: List[dict]):
-    for m in messages:
-        if m["role"] == "user":
-            with st.chat_message("user"):
-                st.markdown(m["content"])
-        else:
-            with st.chat_message("assistant"):
-                st.markdown(m["content"])
-
-def inject_web_context_if_enabled(user_msg: str) -> Optional[str]:
-    s = st.session_state.settings
-    if not s.get("use_tavily", True):
-        return None
-    data = tavily_search(
-        query=user_msg,
-        depth=s.get("tavily_depth", "basic"),
-        max_results=int(s.get("tavily_max_results", 5))
-    )
-    return format_tavily_context(data)
-
 # =========================
 # Bloco: Raspagem de HTML
 # =========================
@@ -353,10 +402,14 @@ with col2:
 
 if scrape_btn and url_input:
     st.session_state.scrape_url = url_input
-    with st.spinner("Baixando e processando HTML..."):
+    with st.spinner("Extraindo conteúdo da página..."):
         res = scrape_url_to_text(url_input, char_limit=st.session_state.settings["scrape_char_limit"])
     if not res.get("ok"):
-        st.error(f"Falha na raspagem: {res.get('error')}")
+        err = res.get("error") or "Falha desconhecida"
+        extra = st.session_state.pop("_last_tavily_extract_error", None)
+        if extra:
+            err += f"\n\nDetalhe Tavily Extract: {extra}"
+        st.error(f"Falha na raspagem: {err}")
     else:
         st.session_state.scrape_context = res["text"]
         st.success(f"Conteúdo raspado de: {res.get('title') or res.get('url')}")
@@ -428,6 +481,6 @@ with st.expander("Diagnóstico técnico"):
     )
 
 st.caption(
-    "Secrets necessários: OPENAI_API_KEY (obrigatório) e TAVILY_API_KEY (recomendado para fallback de raspagem e busca). "
+    "Secrets: OPENAI_API_KEY (obrigatório) e TAVILY_API_KEY (opcional, para busca e fallback). "
     "Nenhuma chave é armazenada no código."
 )
