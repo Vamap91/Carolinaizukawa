@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chatgpt-web-scraper-app")
 
 # =========================
-# Secrets seguros
+# Secrets seguros (sem chaves hardcoded)
 # =========================
 def get_secret(name: str) -> Optional[str]:
     try:
@@ -32,13 +32,10 @@ def get_secret(name: str) -> Optional[str]:
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 
-# Validação: não usamos chaves hardcoded.
-# Se não houver OPENAI_API_KEY em Secrets, o app para com mensagem clara.
 if not OPENAI_API_KEY:
     st.error("Defina OPENAI_API_KEY em Secrets antes de usar.")
     st.stop()
 
-# SDK moderno da OpenAI
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 from openai import OpenAI
 client = OpenAI()
@@ -128,7 +125,6 @@ with st.sidebar:
         min_value=1000, max_value=20000, value=int(st.session_state.settings.get("scrape_char_limit", 8000)), step=500
     )
 
-    # Atualiza objeto de configuração validado
     try:
         cfg = AppSettings(
             model=model,
@@ -154,10 +150,10 @@ with st.sidebar:
 # Cabeçalho
 # =========================
 st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
-st.caption("Cole um link para raspar HTML, ative a busca Tavily se desejar, e gere respostas com contexto atualizado.")
+st.caption("Cole um link para raspar HTML. Se o site bloquear (403), usamos Tavily Extract como fallback.")
 
 # =========================
-# Utilidades: Tavily + Scraper
+# Utilidades: OpenAI + Tavily + Scraper
 # =========================
 def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
     full_messages = [{"role": "system", "content": system_prompt}] + messages
@@ -195,13 +191,35 @@ def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dic
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logger.exception("Erro Tavily")
+        logger.exception("Erro Tavily (search)")
         return {"error": f"Erro ao consultar Tavily: {e}"}
+
+def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
+    """
+    Fallback para extrair texto de uma URL usando Tavily Extract API.
+    Retorna um dicionário com keys 'ok', 'title', 'content', 'error'.
+    """
+    if not TAVILY_API_KEY:
+        return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida."}
+    import requests
+    api = "https://api.tavily.com/extract"
+    payload = {"api_key": TAVILY_API_KEY, "url": url_to_fetch}
+    try:
+        resp = requests.post(api, json=payload, timeout=45)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        title = data.get("title") or ""
+        content = data.get("content") or data.get("text") or ""
+        if not content:
+            return {"ok": False, "title": title, "content": "", "error": "Sem conteúdo retornado pela Tavily."}
+        return {"ok": True, "title": title, "content": content, "error": None}
+    except Exception as e:
+        logger.exception("Erro Tavily (extract)")
+        return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}"}
 
 def format_tavily_context(data: Dict[str, Any]) -> str:
     if "error" in data:
         return f"(Falha ao obter contexto da web: {data['error']})"
-
     answer = data.get("answer") or ""
     results = data.get("results", []) or []
     top = results[:5]
@@ -213,7 +231,6 @@ def format_tavily_context(data: Dict[str, Any]) -> str:
         if len(snippet) > 220:
             snippet = snippet[:217] + "..."
         lines.append(f"{i}. **{title}** — {snippet}\n   {url}")
-
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     header = f"### Contexto de pesquisa web (Tavily) — {ts}\n"
     if answer:
@@ -230,52 +247,75 @@ def normalize_whitespace(text: str) -> str:
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
 
-def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
+def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
     """
-    Faz download do HTML e extrai texto legível removendo <script>, <style>, etc.
-    Retorna { 'ok': bool, 'url': str, 'title': str, 'text': str, 'error': Optional[str] }
+    Tenta baixar HTML diretamente. Retorna dict com ok/title/text/error/status_code.
     """
-    if not url or not isinstance(url, str):
-        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
-
     import requests
     from bs4 import BeautifulSoup
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; StreamlitScraper/1.0)"
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "close",
+        "Upgrade-Insecure-Requests": "1",
     }
     try:
         resp = requests.get(url, headers=headers, timeout=45)
-        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        status = resp.status_code
+        if status >= 400:
+            return {"ok": False, "title": "", "text": "", "error": f"HTTP {status}", "status_code": status}
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
+        try:
+            soup = BeautifulSoup(resp.text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template"]):
+            tag.decompose()
+        title = (soup.title.string if soup.title else "") or ""
+        text = normalize_whitespace(soup.get_text(separator="\n"))
+        return {"ok": True, "title": title.strip(), "text": text, "error": None, "status_code": status}
     except Exception as e:
-        logger.exception("Erro ao baixar HTML")
-        return {"ok": False, "url": url, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}"}
+        logger.exception("Erro no download direto")
+        return {"ok": False, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}", "status_code": None}
 
-    content_type = resp.headers.get("Content-Type", "")
-    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-        return {"ok": False, "url": url, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}"}
+def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
+    """
+    Estratégia em camadas:
+      1) Tenta raspagem direta (headers realistas).
+      2) Se 401/403/406/429 ou erro → fallback para Tavily Extract (se chave existir).
+    """
+    if not url or not isinstance(url, str):
+        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
 
-    html = resp.text
-    try:
-        soup = BeautifulSoup(html, "lxml")
-    except Exception:
-        # Fallback caso lxml falhe
-        soup = BeautifulSoup(html, "html.parser")
+    # 1) Tentativa direta
+    direct = scrape_direct(url)
+    if direct.get("ok"):
+        text = direct["text"]
+        if len(text) > char_limit:
+            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
+        return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
 
-    # Remove elementos não-textuais
-    for tag in soup(["script", "style", "noscript", "template"]):
-        tag.decompose()
+    status = direct.get("status_code")
+    hard_block = status in {401, 403, 406, 429}
+    if not hard_block and TAVILY_API_KEY is None:
+        # erro que não é bloqueio + sem Tavily → reporta direto
+        return {"ok": False, "url": url, "title": "", "text": "", "error": direct.get("error") or "Falha desconhecida"}
 
-    title = (soup.title.string if soup.title else "") or ""
-    # Texto principal simples
-    text = soup.get_text(separator="\n")
-    text = normalize_whitespace(text)
+    # 2) Fallback via Tavily Extract
+    te = tavily_extract(url)
+    if not te.get("ok"):
+        return {"ok": False, "url": url, "title": te.get("title") or "", "text": "", "error": te.get("error") or direct.get("error")}
 
-    # Limita comprimento para não poluir o prompt
+    text = normalize_whitespace(te["content"])
     if len(text) > char_limit:
         text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-
-    return {"ok": True, "url": url, "title": title.strip(), "text": text, "error": None}
+    return {"ok": True, "url": url, "title": te.get("title") or url, "text": text, "error": None}
 
 def render_history(messages: List[dict]):
     for m in messages:
@@ -336,7 +376,7 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 2) Opcional: injeta contexto do scraper (se disponível e habilitado)
+    # 2) Opcional: injeta contexto do scraper
     s = st.session_state.settings
     if s.get("inject_scrape", True) and st.session_state.scrape_context:
         scraped_md = "### Contexto de página (raspado via URL)\n\n" + st.session_state.scrape_context
@@ -388,6 +428,6 @@ with st.expander("Diagnóstico técnico"):
     )
 
 st.caption(
-    "Defina OPENAI_API_KEY (obrigatório) e TAVILY_API_KEY (opcional) em Secrets. "
+    "Secrets necessários: OPENAI_API_KEY (obrigatório) e TAVILY_API_KEY (recomendado para fallback de raspagem e busca). "
     "Nenhuma chave é armazenada no código."
 )
